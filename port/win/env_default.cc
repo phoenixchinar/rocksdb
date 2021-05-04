@@ -7,20 +7,20 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#if defined(OS_WIN)
+
 #include <mutex>
 
-#include <rocksdb/env.h>
 #include "port/win/env_win.h"
+#include "rocksdb/env.h"
+#include "test_util/sync_point.h"
+#include "util/compression_context_cache.h"
+#include "util/thread_local.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 namespace port {
 
-// We choose to create this on the heap and using std::once for the following
-// reasons
-// 1) Currently available MS compiler does not implement atomic C++11
-// initialization of
-//    function local statics
-// 2) We choose not to destroy the env because joining the threads from the
+// We choose not to destroy the env because joining the threads from the
 // system loader
 //    which destroys the statics (same as from DLLMain) creates a system loader
 //    dead-lock.
@@ -29,14 +29,17 @@ namespace {
   std::once_flag winenv_once_flag;
   Env* envptr;
 };
-
 }
 
 Env* Env::Default() {
   using namespace port;
+  ThreadLocalPtr::InitSingletons();
+  CompressionContextCache::InitSingleton();
+  INIT_SYNC_POINT_SINGLETONS();
   std::call_once(winenv_once_flag, []() { envptr = new WinEnv(); });
   return envptr;
 }
 
-}
+}  // namespace ROCKSDB_NAMESPACE
 
+#endif

@@ -13,6 +13,12 @@ import java.util.Objects;
  * ColumnFamily Pointers.
  */
 public class ColumnFamilyHandle extends RocksObject {
+  /**
+   * Constructs column family Java object, which operates on underlying native object.
+   *
+   * @param rocksDB db instance associated with this column family
+   * @param nativeHandle native handle to underlying native ColumnFamily object
+   */
   ColumnFamilyHandle(final RocksDB rocksDB,
       final long nativeHandle) {
     super(nativeHandle);
@@ -25,11 +31,36 @@ public class ColumnFamilyHandle extends RocksObject {
   }
 
   /**
+   * Constructor called only from JNI.
+   *
+   * NOTE: we are producing an additional Java Object here to represent the underlying native C++
+   * ColumnFamilyHandle object. The underlying object is not owned by ourselves. The Java API user
+   * likely already had a ColumnFamilyHandle Java object which owns the underlying C++ object, as
+   * they will have been presented it when they opened the database or added a Column Family.
+   *
+   *
+   * TODO(AR) - Potentially a better design would be to cache the active Java Column Family Objects
+   * in RocksDB, and return the same Java Object instead of instantiating a new one here. This could
+   * also help us to improve the Java API semantics for Java users. See for example
+   * https://github.com/facebook/rocksdb/issues/2687.
+   *
+   * @param nativeHandle native handle to the column family.
+   */
+  ColumnFamilyHandle(final long nativeHandle) {
+    super(nativeHandle);
+    rocksDB_ = null;
+    disOwnNativeHandle();
+  }
+
+  /**
    * Gets the name of the Column Family.
    *
    * @return The name of the Column Family.
+   *
+   * @throws RocksDBException if an error occurs whilst retrieving the name.
    */
-  public byte[] getName() {
+  public byte[] getName() throws RocksDBException {
+    assert(isOwningHandle() || isDefaultColumnFamily());
     return getName(nativeHandle_);
   }
 
@@ -39,6 +70,7 @@ public class ColumnFamilyHandle extends RocksObject {
    * @return the ID of the Column Family.
    */
   public int getID() {
+    assert(isOwningHandle() || isDefaultColumnFamily());
     return getID(nativeHandle_);
   }
 
@@ -57,7 +89,7 @@ public class ColumnFamilyHandle extends RocksObject {
    *     descriptor.
    */
   public ColumnFamilyDescriptor getDescriptor() throws RocksDBException {
-    assert(isOwningHandle());
+    assert(isOwningHandle() || isDefaultColumnFamily());
     return getDescriptor(nativeHandle_);
   }
 
@@ -71,14 +103,28 @@ public class ColumnFamilyHandle extends RocksObject {
     }
 
     final ColumnFamilyHandle that = (ColumnFamilyHandle) o;
-    return rocksDB_.nativeHandle_ == that.rocksDB_.nativeHandle_ &&
-        getID() == that.getID() &&
-        Arrays.equals(getName(), that.getName());
+    try {
+      return rocksDB_.nativeHandle_ == that.rocksDB_.nativeHandle_ &&
+          getID() == that.getID() &&
+          Arrays.equals(getName(), that.getName());
+    } catch (RocksDBException e) {
+      throw new RuntimeException("Cannot compare column family handles", e);
+    }
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(getName(), getID(), rocksDB_.nativeHandle_);
+    try {
+      int result = Objects.hash(getID(), rocksDB_.nativeHandle_);
+      result = 31 * result + Arrays.hashCode(getName());
+      return result;
+    } catch (RocksDBException e) {
+      throw new RuntimeException("Cannot calculate hash code of column family handle", e);
+    }
+  }
+
+  protected boolean isDefaultColumnFamily() {
+    return nativeHandle_ == rocksDB_.getDefaultColumnFamily().nativeHandle_;
   }
 
   /**
@@ -96,7 +142,7 @@ public class ColumnFamilyHandle extends RocksObject {
     }
   }
 
-  private native byte[] getName(final long handle);
+  private native byte[] getName(final long handle) throws RocksDBException;
   private native int getID(final long handle);
   private native ColumnFamilyDescriptor getDescriptor(final long handle) throws RocksDBException;
   @Override protected final native void disposeInternal(final long handle);

@@ -46,14 +46,14 @@
 #include <algorithm>
 #include <atomic>
 #include <type_traits>
+#include "memory/allocator.h"
 #include "port/likely.h"
 #include "port/port.h"
 #include "rocksdb/slice.h"
-#include "util/allocator.h"
 #include "util/coding.h"
 #include "util/random.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 template <class Comparator>
 class InlineSkipList {
@@ -74,6 +74,9 @@ class InlineSkipList {
   explicit InlineSkipList(Comparator cmp, Allocator* allocator,
                           int32_t max_height = 12,
                           int32_t branching_factor = 4);
+  // No copying allowed
+  InlineSkipList(const InlineSkipList&) = delete;
+  InlineSkipList& operator=(const InlineSkipList&) = delete;
 
   // Allocates a key and a skip-list node, returning a pointer to the key
   // portion of the node.  This method is thread-safe if the allocator
@@ -82,6 +85,9 @@ class InlineSkipList {
 
   // Allocate a splice using allocator.
   Splice* AllocateSplice();
+
+  // Allocate a splice on heap.
+  Splice* AllocateSpliceOnHeap();
 
   // Inserts a key allocated by AllocateKey, after the actual key value
   // has been filled in.
@@ -101,6 +107,12 @@ class InlineSkipList {
   // REQUIRES: nothing that compares equal to key is currently in the list.
   // REQUIRES: no concurrent calls to any of inserts.
   bool InsertWithHint(const char* key, void** hint);
+
+  // Like InsertConcurrently, but with a hint
+  //
+  // REQUIRES: nothing that compares equal to key is currently in the list.
+  // REQUIRES: no concurrent calls that use same hint
+  bool InsertWithHintConcurrently(const char* key, void** hint);
 
   // Like Insert, but external synchronization is not required.
   bool InsertConcurrently(const char* key);
@@ -184,10 +196,9 @@ class InlineSkipList {
   const uint16_t kBranching_;
   const uint32_t kScaledInverseBranching_;
 
+  Allocator* const allocator_;  // Allocator used for allocations of nodes
   // Immutable after construction
   Comparator const compare_;
-  Allocator* const allocator_;  // Allocator used for allocations of nodes
-
   Node* const head_;
 
   // Modified only by Insert().  Read racily by readers, but stale
@@ -255,10 +266,6 @@ class InlineSkipList {
   // lowest_level (inclusive).
   void RecomputeSpliceLevels(const DecodedKey& key, Splice* splice,
                              int recompute_level);
-
-  // No copying allowed
-  InlineSkipList(const InlineSkipList&);
-  InlineSkipList& operator=(const InlineSkipList&);
 };
 
 // Implementation details follow
@@ -287,7 +294,7 @@ struct InlineSkipList<Comparator>::Node {
   // next_[0].  This is used for passing data from AllocateKey to Insert.
   void StashHeight(const int height) {
     assert(sizeof(int) <= sizeof(next_[0]));
-    memcpy(&next_[0], &height, sizeof(int));
+    memcpy(static_cast<void*>(&next_[0]), &height, sizeof(int));
   }
 
   // Retrieves the value passed to StashHeight.  Undefined after a call
@@ -307,30 +314,30 @@ struct InlineSkipList<Comparator>::Node {
     assert(n >= 0);
     // Use an 'acquire load' so that we observe a fully initialized
     // version of the returned Node.
-    return (next_[-n].load(std::memory_order_acquire));
+    return ((&next_[0] - n)->load(std::memory_order_acquire));
   }
 
   void SetNext(int n, Node* x) {
     assert(n >= 0);
     // Use a 'release store' so that anybody who reads through this
     // pointer observes a fully initialized version of the inserted node.
-    next_[-n].store(x, std::memory_order_release);
+    (&next_[0] - n)->store(x, std::memory_order_release);
   }
 
   bool CASNext(int n, Node* expected, Node* x) {
     assert(n >= 0);
-    return next_[-n].compare_exchange_strong(expected, x);
+    return (&next_[0] - n)->compare_exchange_strong(expected, x);
   }
 
   // No-barrier variants that can be safely used in a few locations.
   Node* NoBarrier_Next(int n) {
     assert(n >= 0);
-    return next_[-n].load(std::memory_order_relaxed);
+    return (&next_[0] - n)->load(std::memory_order_relaxed);
   }
 
   void NoBarrier_SetNext(int n, Node* x) {
     assert(n >= 0);
-    next_[-n].store(x, std::memory_order_relaxed);
+    (&next_[0] - n)->store(x, std::memory_order_relaxed);
   }
 
   // Insert node after prev on specific level.
@@ -587,8 +594,8 @@ InlineSkipList<Comparator>::InlineSkipList(const Comparator cmp,
     : kMaxHeight_(static_cast<uint16_t>(max_height)),
       kBranching_(static_cast<uint16_t>(branching_factor)),
       kScaledInverseBranching_((Random::kMaxNext + 1) / kBranching_),
-      compare_(cmp),
       allocator_(allocator),
+      compare_(cmp),
       head_(AllocateNode(0, max_height)),
       max_height_(1),
       seq_splice_(AllocateSplice()) {
@@ -645,6 +652,18 @@ InlineSkipList<Comparator>::AllocateSplice() {
 }
 
 template <class Comparator>
+typename InlineSkipList<Comparator>::Splice*
+InlineSkipList<Comparator>::AllocateSpliceOnHeap() {
+  size_t array_size = sizeof(Node*) * (kMaxHeight_ + 1);
+  char* raw = new char[sizeof(Splice) + array_size * 2];
+  Splice* splice = reinterpret_cast<Splice*>(raw);
+  splice->height_ = 0;
+  splice->prev_ = reinterpret_cast<Node**>(raw + sizeof(Splice));
+  splice->next_ = reinterpret_cast<Node**>(raw + sizeof(Splice) + array_size);
+  return splice;
+}
+
+template <class Comparator>
 bool InlineSkipList<Comparator>::Insert(const char* key) {
   return Insert<false>(key, seq_splice_, false);
 }
@@ -668,6 +687,18 @@ bool InlineSkipList<Comparator>::InsertWithHint(const char* key, void** hint) {
     *hint = reinterpret_cast<void*>(splice);
   }
   return Insert<false>(key, splice, true);
+}
+
+template <class Comparator>
+bool InlineSkipList<Comparator>::InsertWithHintConcurrently(const char* key,
+                                                            void** hint) {
+  assert(hint != nullptr);
+  Splice* splice = reinterpret_cast<Splice*>(*hint);
+  if (splice == nullptr) {
+    splice = AllocateSpliceOnHeap();
+    *hint = reinterpret_cast<void*>(splice);
+  }
+  return Insert<true>(key, splice, true);
 }
 
 template <class Comparator>
@@ -963,4 +994,4 @@ void InlineSkipList<Comparator>::TEST_Validate() const {
   }
 }
 
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE

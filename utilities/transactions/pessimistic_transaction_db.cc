@@ -5,41 +5,33 @@
 
 #ifndef ROCKSDB_LITE
 
-#ifndef __STDC_FORMAT_MACROS
-#define __STDC_FORMAT_MACROS
-#endif
-
 #include "utilities/transactions/pessimistic_transaction_db.h"
 
-#include <inttypes.h>
+#include <cinttypes>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
-#include "db/db_impl.h"
+#include "db/db_impl/db_impl.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
 #include "rocksdb/utilities/transaction_db.h"
+#include "test_util/sync_point.h"
 #include "util/cast_util.h"
 #include "util/mutexlock.h"
-#include "util/sync_point.h"
 #include "utilities/transactions/pessimistic_transaction.h"
 #include "utilities/transactions/transaction_db_mutex_impl.h"
 #include "utilities/transactions/write_prepared_txn_db.h"
+#include "utilities/transactions/write_unprepared_txn_db.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 PessimisticTransactionDB::PessimisticTransactionDB(
     DB* db, const TransactionDBOptions& txn_db_options)
     : TransactionDB(db),
-      db_impl_(static_cast_with_check<DBImpl, DB>(db)),
+      db_impl_(static_cast_with_check<DBImpl>(db)),
       txn_db_options_(txn_db_options),
-      lock_mgr_(this, txn_db_options_.num_stripes, txn_db_options.max_num_locks,
-                txn_db_options_.max_num_deadlocks,
-                txn_db_options_.custom_mutex_factory
-                    ? txn_db_options_.custom_mutex_factory
-                    : std::shared_ptr<TransactionDBMutexFactory>(
-                          new TransactionDBMutexFactoryImpl())) {
+      lock_manager_(NewLockManager(this, txn_db_options)) {
   assert(db_impl_ != nullptr);
   info_log_ = db_impl_->GetDBOptions().info_log;
 }
@@ -63,14 +55,9 @@ PessimisticTransactionDB::PessimisticTransactionDB(
 PessimisticTransactionDB::PessimisticTransactionDB(
     StackableDB* db, const TransactionDBOptions& txn_db_options)
     : TransactionDB(db),
-      db_impl_(static_cast_with_check<DBImpl, DB>(db->GetRootDB())),
+      db_impl_(static_cast_with_check<DBImpl>(db->GetRootDB())),
       txn_db_options_(txn_db_options),
-      lock_mgr_(this, txn_db_options_.num_stripes, txn_db_options.max_num_locks,
-                txn_db_options_.max_num_deadlocks,
-                txn_db_options_.custom_mutex_factory
-                    ? txn_db_options_.custom_mutex_factory
-                    : std::shared_ptr<TransactionDBMutexFactory>(
-                          new TransactionDBMutexFactoryImpl())) {
+      lock_manager_(NewLockManager(this, txn_db_options)) {
   assert(db_impl_ != nullptr);
 }
 
@@ -116,37 +103,49 @@ Status PessimisticTransactionDB::Initialize(
   Status s = EnableAutoCompaction(compaction_enabled_cf_handles);
 
   // create 'real' transactions from recovered shell transactions
-  auto dbimpl = reinterpret_cast<DBImpl*>(GetRootDB());
+  auto dbimpl = static_cast_with_check<DBImpl>(GetRootDB());
   assert(dbimpl != nullptr);
   auto rtrxs = dbimpl->recovered_transactions();
 
-  for (auto it = rtrxs.begin(); it != rtrxs.end(); it++) {
+  for (auto it = rtrxs.begin(); it != rtrxs.end(); ++it) {
     auto recovered_trx = it->second;
     assert(recovered_trx);
-    assert(recovered_trx->log_number_);
+    assert(recovered_trx->batches_.size() == 1);
+    const auto& seq = recovered_trx->batches_.begin()->first;
+    const auto& batch_info = recovered_trx->batches_.begin()->second;
+    assert(batch_info.log_number_);
     assert(recovered_trx->name_.length());
 
     WriteOptions w_options;
     w_options.sync = true;
     TransactionOptions t_options;
+    // This would help avoiding deadlock for keys that although exist in the WAL
+    // did not go through concurrency control. This includes the merge that
+    // MyRocks uses for auto-inc columns. It is safe to do so, since (i) if
+    // there is a conflict between the keys of two transactions that must be
+    // avoided, it is already avoided by the application, MyRocks, before the
+    // restart (ii) application, MyRocks, guarntees to rollback/commit the
+    // recovered transactions before new transactions start.
+    t_options.skip_concurrency_control = true;
 
     Transaction* real_trx = BeginTransaction(w_options, t_options, nullptr);
     assert(real_trx);
-    real_trx->SetLogNumber(recovered_trx->log_number_);
-    assert(recovered_trx->seq_ != kMaxSequenceNumber);
-    real_trx->SetId(recovered_trx->seq_);
+    real_trx->SetLogNumber(batch_info.log_number_);
+    assert(seq != kMaxSequenceNumber);
+    if (GetTxnDBOptions().write_policy != WRITE_COMMITTED) {
+      real_trx->SetId(seq);
+    }
 
     s = real_trx->SetName(recovered_trx->name_);
     if (!s.ok()) {
       break;
     }
 
-    s = real_trx->RebuildFromWriteBatch(recovered_trx->batch_);
+    s = real_trx->RebuildFromWriteBatch(batch_info.batch_);
     // WriteCommitted set this to to disable this check that is specific to
     // WritePrepared txns
-    assert(recovered_trx->batch_cnt_ == 0 ||
-           real_trx->GetWriteBatch()->SubBatchCnt() ==
-               recovered_trx->batch_cnt_);
+    assert(batch_info.batch_cnt_ == 0 ||
+           real_trx->GetWriteBatch()->SubBatchCnt() == batch_info.batch_cnt_);
     real_trx->SetState(Transaction::PREPARED);
     if (!s.ok()) {
       break;
@@ -207,21 +206,48 @@ Status TransactionDB::Open(
     const std::vector<ColumnFamilyDescriptor>& column_families,
     std::vector<ColumnFamilyHandle*>* handles, TransactionDB** dbptr) {
   Status s;
-  DB* db;
+  DB* db = nullptr;
+  if (txn_db_options.write_policy == WRITE_COMMITTED &&
+      db_options.unordered_write) {
+    return Status::NotSupported(
+        "WRITE_COMMITTED is incompatible with unordered_writes");
+  }
+  if (txn_db_options.write_policy == WRITE_UNPREPARED &&
+      db_options.unordered_write) {
+    // TODO(lth): support it
+    return Status::NotSupported(
+        "WRITE_UNPREPARED is currently incompatible with unordered_writes");
+  }
+  if (txn_db_options.write_policy == WRITE_PREPARED &&
+      db_options.unordered_write && !db_options.two_write_queues) {
+    return Status::NotSupported(
+        "WRITE_PREPARED is incompatible with unordered_writes if "
+        "two_write_queues is not enabled.");
+  }
 
-  ROCKS_LOG_WARN(db_options.info_log, "Transaction write_policy is %" PRId32,
-                 static_cast<int>(txn_db_options.write_policy));
   std::vector<ColumnFamilyDescriptor> column_families_copy = column_families;
   std::vector<size_t> compaction_enabled_cf_indices;
   DBOptions db_options_2pc = db_options;
   PrepareWrap(&db_options_2pc, &column_families_copy,
               &compaction_enabled_cf_indices);
-  const bool use_seq_per_batch = txn_db_options.write_policy == WRITE_PREPARED;
+  const bool use_seq_per_batch =
+      txn_db_options.write_policy == WRITE_PREPARED ||
+      txn_db_options.write_policy == WRITE_UNPREPARED;
+  const bool use_batch_per_txn =
+      txn_db_options.write_policy == WRITE_COMMITTED ||
+      txn_db_options.write_policy == WRITE_PREPARED;
   s = DBImpl::Open(db_options_2pc, dbname, column_families_copy, handles, &db,
-                   use_seq_per_batch);
+                   use_seq_per_batch, use_batch_per_txn);
   if (s.ok()) {
+    ROCKS_LOG_WARN(db->GetDBOptions().info_log,
+                   "Transaction write_policy is %" PRId32,
+                   static_cast<int>(txn_db_options.write_policy));
     s = WrapDB(db, txn_db_options, compaction_enabled_cf_indices, *handles,
                dbptr);
+  }
+  if (!s.ok()) {
+    // just in case it was not deleted (and not set to nullptr).
+    delete db;
   }
   return s;
 }
@@ -235,9 +261,11 @@ void TransactionDB::PrepareWrap(
   for (size_t i = 0; i < column_families->size(); i++) {
     ColumnFamilyOptions* cf_options = &(*column_families)[i].options;
 
-    if (cf_options->max_write_buffer_number_to_maintain == 0) {
-      // Setting to -1 will set the History size to max_write_buffer_number.
-      cf_options->max_write_buffer_number_to_maintain = -1;
+    if (cf_options->max_write_buffer_size_to_maintain == 0 &&
+        cf_options->max_write_buffer_number_to_maintain == 0) {
+      // Setting to -1 will set the History size to
+      // max_write_buffer_number * write_buffer_size.
+      cf_options->max_write_buffer_size_to_maintain = -1;
     }
     if (!cf_options->disable_auto_compactions) {
       // Disable compactions momentarily to prevent race with DB::Open
@@ -248,62 +276,66 @@ void TransactionDB::PrepareWrap(
   db_options->allow_2pc = true;
 }
 
+namespace {
+template <typename DBType>
+Status WrapAnotherDBInternal(
+    DBType* db, const TransactionDBOptions& txn_db_options,
+    const std::vector<size_t>& compaction_enabled_cf_indices,
+    const std::vector<ColumnFamilyHandle*>& handles, TransactionDB** dbptr) {
+  assert(db != nullptr);
+  assert(dbptr != nullptr);
+  *dbptr = nullptr;
+  std::unique_ptr<PessimisticTransactionDB> txn_db;
+  switch (txn_db_options.write_policy) {
+    case WRITE_UNPREPARED:
+      txn_db.reset(new WriteUnpreparedTxnDB(
+          db, PessimisticTransactionDB::ValidateTxnDBOptions(txn_db_options)));
+      break;
+    case WRITE_PREPARED:
+      txn_db.reset(new WritePreparedTxnDB(
+          db, PessimisticTransactionDB::ValidateTxnDBOptions(txn_db_options)));
+      break;
+    case WRITE_COMMITTED:
+    default:
+      txn_db.reset(new WriteCommittedTxnDB(
+          db, PessimisticTransactionDB::ValidateTxnDBOptions(txn_db_options)));
+  }
+  txn_db->UpdateCFComparatorMap(handles);
+  Status s = txn_db->Initialize(compaction_enabled_cf_indices, handles);
+  // In case of a failure at this point, db is deleted via the txn_db destructor
+  // and set to nullptr.
+  if (s.ok()) {
+    *dbptr = txn_db.release();
+  }
+  return s;
+}
+}  // namespace
+
 Status TransactionDB::WrapDB(
     // make sure this db is already opened with memtable history enabled,
     // auto compaction distabled and 2 phase commit enabled
     DB* db, const TransactionDBOptions& txn_db_options,
     const std::vector<size_t>& compaction_enabled_cf_indices,
     const std::vector<ColumnFamilyHandle*>& handles, TransactionDB** dbptr) {
-  PessimisticTransactionDB* txn_db;
-  switch (txn_db_options.write_policy) {
-    case WRITE_UNPREPARED:
-      return Status::NotSupported("WRITE_UNPREPARED is not implemented yet");
-    case WRITE_PREPARED:
-      txn_db = new WritePreparedTxnDB(
-          db, PessimisticTransactionDB::ValidateTxnDBOptions(txn_db_options));
-      break;
-    case WRITE_COMMITTED:
-    default:
-      txn_db = new WriteCommittedTxnDB(
-          db, PessimisticTransactionDB::ValidateTxnDBOptions(txn_db_options));
-  }
-  txn_db->UpdateCFComparatorMap(handles);
-  *dbptr = txn_db;
-  Status s = txn_db->Initialize(compaction_enabled_cf_indices, handles);
-  return s;
+  return WrapAnotherDBInternal(db, txn_db_options,
+                               compaction_enabled_cf_indices, handles, dbptr);
 }
 
 Status TransactionDB::WrapStackableDB(
     // make sure this stackable_db is already opened with memtable history
-    // enabled,
-    // auto compaction distabled and 2 phase commit enabled
+    // enabled, auto compaction distabled and 2 phase commit enabled
     StackableDB* db, const TransactionDBOptions& txn_db_options,
     const std::vector<size_t>& compaction_enabled_cf_indices,
     const std::vector<ColumnFamilyHandle*>& handles, TransactionDB** dbptr) {
-  PessimisticTransactionDB* txn_db;
-  switch (txn_db_options.write_policy) {
-    case WRITE_UNPREPARED:
-      return Status::NotSupported("WRITE_UNPREPARED is not implemented yet");
-    case WRITE_PREPARED:
-      txn_db = new WritePreparedTxnDB(
-          db, PessimisticTransactionDB::ValidateTxnDBOptions(txn_db_options));
-      break;
-    case WRITE_COMMITTED:
-    default:
-      txn_db = new WriteCommittedTxnDB(
-          db, PessimisticTransactionDB::ValidateTxnDBOptions(txn_db_options));
-  }
-  txn_db->UpdateCFComparatorMap(handles);
-  *dbptr = txn_db;
-  Status s = txn_db->Initialize(compaction_enabled_cf_indices, handles);
-  return s;
+  return WrapAnotherDBInternal(db, txn_db_options,
+                               compaction_enabled_cf_indices, handles, dbptr);
 }
 
-// Let TransactionLockMgr know that this column family exists so it can
+// Let LockManager know that this column family exists so it can
 // allocate a LockMap for it.
 void PessimisticTransactionDB::AddColumnFamily(
     const ColumnFamilyHandle* handle) {
-  lock_mgr_.AddColumnFamily(handle->GetID());
+  lock_manager_->AddColumnFamily(handle);
 }
 
 Status PessimisticTransactionDB::CreateColumnFamily(
@@ -317,14 +349,14 @@ Status PessimisticTransactionDB::CreateColumnFamily(
 
   s = db_->CreateColumnFamily(options, column_family_name, handle);
   if (s.ok()) {
-    lock_mgr_.AddColumnFamily((*handle)->GetID());
+    lock_manager_->AddColumnFamily(*handle);
     UpdateCFComparatorMap(*handle);
   }
 
   return s;
 }
 
-// Let TransactionLockMgr know that it can deallocate the LockMap for this
+// Let LockManager know that it can deallocate the LockMap for this
 // column family.
 Status PessimisticTransactionDB::DropColumnFamily(
     ColumnFamilyHandle* column_family) {
@@ -332,7 +364,7 @@ Status PessimisticTransactionDB::DropColumnFamily(
 
   Status s = db_->DropColumnFamily(column_family);
   if (s.ok()) {
-    lock_mgr_.RemoveColumnFamily(column_family->GetID());
+    lock_manager_->RemoveColumnFamily(column_family);
   }
 
   return s;
@@ -342,17 +374,25 @@ Status PessimisticTransactionDB::TryLock(PessimisticTransaction* txn,
                                          uint32_t cfh_id,
                                          const std::string& key,
                                          bool exclusive) {
-  return lock_mgr_.TryLock(txn, cfh_id, key, GetEnv(), exclusive);
+  return lock_manager_->TryLock(txn, cfh_id, key, GetEnv(), exclusive);
+}
+
+Status PessimisticTransactionDB::TryRangeLock(PessimisticTransaction* txn,
+                                              uint32_t cfh_id,
+                                              const Endpoint& start_endp,
+                                              const Endpoint& end_endp) {
+  return lock_manager_->TryLock(txn, cfh_id, start_endp, end_endp, GetEnv(),
+                                /*exclusive=*/true);
 }
 
 void PessimisticTransactionDB::UnLock(PessimisticTransaction* txn,
-                                      const TransactionKeyMap* keys) {
-  lock_mgr_.UnLock(txn, keys, GetEnv());
+                                      const LockTracker& keys) {
+  lock_manager_->UnLock(txn, keys, GetEnv());
 }
 
 void PessimisticTransactionDB::UnLock(PessimisticTransaction* txn,
                                       uint32_t cfh_id, const std::string& key) {
-  lock_mgr_.UnLock(txn, cfh_id, key, GetEnv());
+  lock_manager_->UnLock(txn, cfh_id, key, GetEnv());
 }
 
 // Used when wrapping DB write operations in a transaction
@@ -464,23 +504,16 @@ Status PessimisticTransactionDB::Merge(const WriteOptions& options,
 
 Status PessimisticTransactionDB::Write(const WriteOptions& opts,
                                        WriteBatch* updates) {
-  // Need to lock all keys in this batch to prevent write conflicts with
-  // concurrent transactions.
-  Transaction* txn = BeginInternalTransaction(opts);
-  txn->DisableIndexing();
+  return WriteWithConcurrencyControl(opts, updates);
+}
 
-  auto txn_impl =
-      static_cast_with_check<PessimisticTransaction, Transaction>(txn);
-
-  // Since commitBatch sorts the keys before locking, concurrent Write()
-  // operations will not cause a deadlock.
-  // In order to avoid a deadlock with a concurrent Transaction, Transactions
-  // should use a lock timeout.
-  Status s = txn_impl->CommitBatch(updates);
-
-  delete txn;
-
-  return s;
+Status WriteCommittedTxnDB::Write(const WriteOptions& opts,
+                                  WriteBatch* updates) {
+  if (txn_db_options_.skip_concurrency_control) {
+    return db_impl_->Write(opts, updates);
+  } else {
+    return WriteWithConcurrencyControl(opts, updates);
+  }
 }
 
 Status WriteCommittedTxnDB::Write(
@@ -489,7 +522,7 @@ Status WriteCommittedTxnDB::Write(
   if (optimizations.skip_concurrency_control) {
     return db_impl_->Write(opts, updates);
   } else {
-    return Write(opts, updates);
+    return WriteWithConcurrencyControl(opts, updates);
   }
 }
 
@@ -520,8 +553,7 @@ bool PessimisticTransactionDB::TryStealingExpiredTransactionLocks(
 void PessimisticTransactionDB::ReinitializeTransaction(
     Transaction* txn, const WriteOptions& write_options,
     const TransactionOptions& txn_options) {
-  auto txn_impl =
-      static_cast_with_check<PessimisticTransaction, Transaction>(txn);
+  auto txn_impl = static_cast_with_check<PessimisticTransaction>(txn);
 
   txn_impl->Reinitialize(this, write_options, txn_options);
 }
@@ -542,24 +574,23 @@ void PessimisticTransactionDB::GetAllPreparedTransactions(
   assert(transv);
   transv->clear();
   std::lock_guard<std::mutex> lock(name_map_mutex_);
-  for (auto it = transactions_.begin(); it != transactions_.end(); it++) {
+  for (auto it = transactions_.begin(); it != transactions_.end(); ++it) {
     if (it->second->GetState() == Transaction::PREPARED) {
       transv->push_back(it->second);
     }
   }
 }
 
-TransactionLockMgr::LockStatusData
-PessimisticTransactionDB::GetLockStatusData() {
-  return lock_mgr_.GetLockStatusData();
+LockManager::PointLockStatus PessimisticTransactionDB::GetLockStatusData() {
+  return lock_manager_->GetPointLockStatus();
 }
 
 std::vector<DeadlockPath> PessimisticTransactionDB::GetDeadlockInfoBuffer() {
-  return lock_mgr_.GetDeadlockInfoBuffer();
+  return lock_manager_->GetDeadlockInfoBuffer();
 }
 
 void PessimisticTransactionDB::SetDeadlockInfoBufferSize(uint32_t target_size) {
-  lock_mgr_.Resize(target_size);
+  lock_manager_->Resize(target_size);
 }
 
 void PessimisticTransactionDB::RegisterTransaction(Transaction* txn) {
@@ -579,5 +610,5 @@ void PessimisticTransactionDB::UnregisterTransaction(Transaction* txn) {
   transactions_.erase(it);
 }
 
-}  //  namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE
 #endif  // ROCKSDB_LITE

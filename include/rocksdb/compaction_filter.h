@@ -6,15 +6,16 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef STORAGE_ROCKSDB_INCLUDE_COMPACTION_FILTER_H_
-#define STORAGE_ROCKSDB_INCLUDE_COMPACTION_FILTER_H_
+#pragma once
 
 #include <cassert>
 #include <memory>
 #include <string>
 #include <vector>
 
-namespace rocksdb {
+#include "rocksdb/rocksdb_namespace.h"
+
+namespace ROCKSDB_NAMESPACE {
 
 class Slice;
 class SliceTransform;
@@ -44,7 +45,12 @@ class CompactionFilter {
     kRemove,
     kChangeValue,
     kRemoveAndSkipUntil,
+    kChangeBlobIndex,  // used internally by BlobDB.
+    kIOError,          // used internally by BlobDB.
+    kUndetermined,
   };
+
+  enum class BlobDecision { kKeep, kChangeValue, kCorruption, kIOError };
 
   // Context information of a compaction run
   struct Context {
@@ -76,14 +82,11 @@ class CompactionFilter {
   // to modify the existing_value and pass it back through new_value.
   // value_changed needs to be set to true in this case.
   //
-  // If you use snapshot feature of RocksDB (i.e. call GetSnapshot() API on a
-  // DB* object), CompactionFilter might not be very useful for you. Due to
-  // guarantees we need to maintain, compaction process will not call Filter()
-  // on any keys that were written before the latest snapshot. In other words,
-  // compaction will only call Filter() on keys written after your most recent
-  // call to GetSnapshot(). In most cases, Filter() will not be called very
-  // often. This is something we're fixing. See the discussion at:
-  // https://www.facebook.com/groups/mysqlonrocksdb/permalink/999723240091865/
+  // Note that RocksDB snapshots (i.e. call GetSnapshot() API on a
+  // DB* object) will not guarantee to preserve the state of the DB with
+  // CompactionFilter. Data seen from a snapshot might disappear after a
+  // compaction finishes. If you use snapshots, think twice about whether you
+  // want to use compaction filter and whether you are using it in a safe way.
   //
   // If multithreaded compaction is being used *and* a single CompactionFilter
   // instance was supplied via Options::compaction_filter, this method may be
@@ -136,9 +139,9 @@ class CompactionFilter {
   //
   //      Caveats:
   //       - The keys are skipped even if there are snapshots containing them,
-  //         as if IgnoreSnapshots() was true; i.e. values removed
-  //         by kRemoveAndSkipUntil can disappear from a snapshot - beware
-  //         if you're using TransactionDB or DB::GetSnapshot().
+  //         i.e. values removed by kRemoveAndSkipUntil can disappear from a
+  //         snapshot - beware if you're using TransactionDB or
+  //         DB::GetSnapshot().
   //       - If value for a key was overwritten or merged into (multiple Put()s
   //         or Merge()s), and compaction filter skips this key with
   //         kRemoveAndSkipUntil, it's possible that it will remove only
@@ -148,6 +151,7 @@ class CompactionFilter {
   //       - If you use kRemoveAndSkipUntil, consider also reducing
   //         compaction_readahead_size option.
   //
+  // Should never return kUndetermined.
   // Note: If you are using a TransactionDB, it is not recommended to filter
   // out or modify merge operands (ValueType::kMergeOperand).
   // If a merge operation is filtered out, TransactionDB may not realize there
@@ -177,26 +181,44 @@ class CompactionFilter {
     return Decision::kKeep;
   }
 
-  // By default, compaction will only call Filter() on keys written after the
-  // most recent call to GetSnapshot(). However, if the compaction filter
-  // overrides IgnoreSnapshots to make it return true, the compaction filter
-  // will be called even if the keys were written before the last snapshot.
-  // This behavior is to be used only when we want to delete a set of keys
-  // irrespective of snapshots. In particular, care should be taken
-  // to understand that the values of these keys will change even if we are
-  // using a snapshot.
-  virtual bool IgnoreSnapshots() const { return false; }
+  // Internal (BlobDB) use only. Do not override in application code.
+  virtual BlobDecision PrepareBlobOutput(const Slice& /* key */,
+                                         const Slice& /* existing_value */,
+                                         std::string* /* new_value */) const {
+    return BlobDecision::kKeep;
+  }
+
+  // This function is deprecated. Snapshots will always be ignored for
+  // compaction filters, because we realized that not ignoring snapshots doesn't
+  // provide the guarantee we initially thought it would provide. Repeatable
+  // reads will not be guaranteed anyway. If you override the function and
+  // returns false, we will fail the compaction.
+  virtual bool IgnoreSnapshots() const { return true; }
 
   // Returns a name that identifies this compaction filter.
   // The name will be printed to LOG file on start up for diagnosis.
   virtual const char* Name() const = 0;
+
+  // Internal (BlobDB) use only. Do not override in application code.
+  virtual bool IsStackedBlobDbInternalCompactionFilter() const { return false; }
+
+  // In the case of BlobDB, it may be possible to reach a decision with only
+  // the key without reading the actual value. Keys whose value_type is
+  // kBlobIndex will be checked by this method.
+  // Returning kUndetermined will cause FilterV2() to be called to make a
+  // decision as usual.
+  virtual Decision FilterBlobByKey(int /*level*/, const Slice& /*key*/,
+                                   std::string* /*new_value*/,
+                                   std::string* /*skip_until*/) const {
+    return Decision::kUndetermined;
+  }
 };
 
 // Each compaction will create a new CompactionFilter allowing the
 // application to know about different compactions
 class CompactionFilterFactory {
  public:
-  virtual ~CompactionFilterFactory() { }
+  virtual ~CompactionFilterFactory() {}
 
   virtual std::unique_ptr<CompactionFilter> CreateCompactionFilter(
       const CompactionFilter::Context& context) = 0;
@@ -205,6 +227,4 @@ class CompactionFilterFactory {
   virtual const char* Name() const = 0;
 };
 
-}  // namespace rocksdb
-
-#endif  // STORAGE_ROCKSDB_INCLUDE_COMPACTION_FILTER_H_
+}  // namespace ROCKSDB_NAMESPACE

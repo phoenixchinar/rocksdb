@@ -11,42 +11,45 @@
 // the last "sync". It then checks for data loss errors by purposely dropping
 // file data (or entire files) not protected by a "sync".
 
-#include "db/db_impl.h"
+#include "db/db_impl/db_impl.h"
 #include "db/log_format.h"
 #include "db/version_set.h"
 #include "env/mock_env.h"
+#include "file/filename.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/table.h"
 #include "rocksdb/write_batch.h"
-#include "util/fault_injection_test_env.h"
-#include "util/filename.h"
-#include "util/logging.h"
+#include "test_util/sync_point.h"
+#include "test_util/testharness.h"
+#include "test_util/testutil.h"
 #include "util/mutexlock.h"
-#include "util/sync_point.h"
-#include "util/testharness.h"
-#include "util/testutil.h"
+#include "util/random.h"
+#include "utilities/fault_injection_env.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 static const int kValueSize = 1000;
 static const int kMaxNumValues = 2000;
 static const size_t kNumIterations = 3;
 
-class FaultInjectionTest : public testing::Test,
-                           public testing::WithParamInterface<bool> {
+enum FaultInjectionOptionConfig {
+  kDefault,
+  kDifferentDataDir,
+  kWalDir,
+  kSyncWal,
+  kWalDirSyncWal,
+  kMultiLevels,
+  kEnd,
+};
+class FaultInjectionTest
+    : public testing::Test,
+      public testing::WithParamInterface<std::tuple<
+          bool, FaultInjectionOptionConfig, FaultInjectionOptionConfig>> {
  protected:
-  enum OptionConfig {
-    kDefault,
-    kDifferentDataDir,
-    kWalDir,
-    kSyncWal,
-    kWalDirSyncWal,
-    kMultiLevels,
-    kEnd,
-  };
   int option_config_;
+  int non_inclusive_end_range_;  // kEnd or equivalent to that
   // When need to make sure data is persistent, sync WAL
   bool sync_use_wal_;
   // When need to make sure data is persistent, call DB::CompactRange()
@@ -67,27 +70,27 @@ class FaultInjectionTest : public testing::Test,
   std::unique_ptr<Env> base_env_;
   FaultInjectionTestEnv* env_;
   std::string dbname_;
-  shared_ptr<Cache> tiny_cache_;
+  std::shared_ptr<Cache> tiny_cache_;
   Options options_;
   DB* db_;
 
   FaultInjectionTest()
-      : option_config_(kDefault),
+      : option_config_(std::get<1>(GetParam())),
+        non_inclusive_end_range_(std::get<2>(GetParam())),
         sync_use_wal_(false),
         sync_use_compact_(true),
         base_env_(nullptr),
         env_(nullptr),
-        db_(nullptr) {
-  }
+        db_(nullptr) {}
 
-  ~FaultInjectionTest() {
-    rocksdb::SyncPoint::GetInstance()->DisableProcessing();
-    rocksdb::SyncPoint::GetInstance()->ClearAllCallBacks();
+  ~FaultInjectionTest() override {
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
   }
 
   bool ChangeOptions() {
     option_config_++;
-    if (option_config_ >= kEnd) {
+    if (option_config_ >= non_inclusive_end_range_) {
       return false;
     } else {
       if (option_config_ == kMultiLevels) {
@@ -104,18 +107,18 @@ class FaultInjectionTest : public testing::Test,
     Options options;
     switch (option_config_) {
       case kWalDir:
-        options.wal_dir = test::TmpDir(env_) + "/fault_test_wal";
+        options.wal_dir = test::PerThreadDBPath(env_, "fault_test_wal");
         break;
       case kDifferentDataDir:
-        options.db_paths.emplace_back(test::TmpDir(env_) + "/fault_test_data",
-                                      1000000U);
+        options.db_paths.emplace_back(
+            test::PerThreadDBPath(env_, "fault_test_data"), 1000000U);
         break;
       case kSyncWal:
         sync_use_wal_ = true;
         sync_use_compact_ = false;
         break;
       case kWalDirSyncWal:
-        options.wal_dir = test::TmpDir(env_) + "/fault_test_wal";
+        options.wal_dir = test::PerThreadDBPath(env_, "/fault_test_wal");
         sync_use_wal_ = true;
         sync_use_compact_ = false;
         break;
@@ -155,7 +158,7 @@ class FaultInjectionTest : public testing::Test,
     table_options.block_cache = tiny_cache_;
     options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
-    dbname_ = test::TmpDir() + "/fault_test";
+    dbname_ = test::PerThreadDBPath("fault_test");
 
     EXPECT_OK(DestroyDB(dbname_, options_));
 
@@ -166,7 +169,7 @@ class FaultInjectionTest : public testing::Test,
   }
 
   void SetUp() override {
-    sequential_order_ = GetParam();
+    sequential_order_ = std::get<0>(GetParam());
     ASSERT_OK(NewDB());
   }
 
@@ -189,7 +192,7 @@ class FaultInjectionTest : public testing::Test,
     for (int i = start_idx; i < start_idx + num_vals; i++) {
       Slice key = Key(i, &key_space);
       batch.Clear();
-      batch.Put(key, Value(i, &value_space));
+      ASSERT_OK(batch.Put(key, Value(i, &value_space)));
       ASSERT_OK(db_->Write(write_options, &batch));
     }
   }
@@ -246,7 +249,8 @@ class FaultInjectionTest : public testing::Test,
   // Return the value to associate with the specified key
   Slice Value(int k, std::string* storage) const {
     Random r(k);
-    return test::RandomString(&r, kValueSize, storage);
+    *storage = r.RandomString(kValueSize);
+    return Slice(*storage);
   }
 
   void CloseDB() {
@@ -268,12 +272,12 @@ class FaultInjectionTest : public testing::Test,
     for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
       ASSERT_OK(db_->Delete(WriteOptions(), iter->key()));
     }
-
+    ASSERT_OK(iter->status());
     delete iter;
 
     FlushOptions flush_options;
     flush_options.wait = true;
-    db_->Flush(flush_options);
+    ASSERT_OK(db_->Flush(flush_options));
   }
 
   // rnd cannot be null for kResetDropRandomUnsyncedData
@@ -306,7 +310,7 @@ class FaultInjectionTest : public testing::Test,
 
     Build(write_options, 0, num_pre_sync);
     if (sync_use_compact_) {
-      db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+      ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
     }
     write_options.sync = false;
     Build(write_options, num_pre_sync, num_post_sync);
@@ -338,12 +342,14 @@ class FaultInjectionTest : public testing::Test,
   }
 
   void WaitCompactionFinish() {
-    static_cast<DBImpl*>(db_->GetRootDB())->TEST_WaitForCompact();
+    ASSERT_OK(static_cast<DBImpl*>(db_->GetRootDB())->TEST_WaitForCompact());
     ASSERT_OK(db_->Put(WriteOptions(), "", ""));
   }
 };
 
-TEST_P(FaultInjectionTest, FaultTest) {
+class FaultInjectionTestSplitted : public FaultInjectionTest {};
+
+TEST_P(FaultInjectionTestSplitted, FaultTest) {
   do {
     Random rnd(301);
 
@@ -403,7 +409,7 @@ TEST_P(FaultInjectionTest, WriteOptionSyncTest) {
   write_options.sync = true;
   ASSERT_OK(
       db_->Put(write_options, Key(2, &key_space), Value(2, &value_space)));
-  db_->FlushWAL(false);
+  ASSERT_OK(db_->FlushWAL(false));
 
   env_->SetFilesystemActive(false);
   NoWriteTestReopenWithFault(kResetDropAndDeleteUnsynced);
@@ -431,42 +437,42 @@ TEST_P(FaultInjectionTest, UninstalledCompaction) {
   OpenDB();
 
   if (!sequential_order_) {
-    rocksdb::SyncPoint::GetInstance()->LoadDependency({
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
         {"FaultInjectionTest::FaultTest:0", "DBImpl::BGWorkCompaction"},
         {"CompactionJob::Run():End", "FaultInjectionTest::FaultTest:1"},
         {"FaultInjectionTest::FaultTest:2",
          "DBImpl::BackgroundCompaction:NonTrivial:AfterRun"},
     });
   }
-  rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
   int kNumKeys = 1000;
   Build(WriteOptions(), 0, kNumKeys);
   FlushOptions flush_options;
   flush_options.wait = true;
-  db_->Flush(flush_options);
+  ASSERT_OK(db_->Flush(flush_options));
   ASSERT_OK(db_->Put(WriteOptions(), "", ""));
   TEST_SYNC_POINT("FaultInjectionTest::FaultTest:0");
   TEST_SYNC_POINT("FaultInjectionTest::FaultTest:1");
   env_->SetFilesystemActive(false);
   TEST_SYNC_POINT("FaultInjectionTest::FaultTest:2");
   CloseDB();
-  rocksdb::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
   ResetDBState(kResetDropUnsyncedData);
 
   std::atomic<bool> opened(false);
-  rocksdb::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::Open:Opened", [&](void* arg) { opened.store(true); });
-  rocksdb::SyncPoint::GetInstance()->SetCallBack(
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::Open:Opened", [&](void* /*arg*/) { opened.store(true); });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::BGWorkCompaction",
-      [&](void* arg) { ASSERT_TRUE(opened.load()); });
-  rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+      [&](void* /*arg*/) { ASSERT_TRUE(opened.load()); });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
   ASSERT_OK(OpenDB());
   ASSERT_OK(Verify(0, kNumKeys, FaultInjectionTest::kValExpectFound));
   WaitCompactionFinish();
   ASSERT_OK(Verify(0, kNumKeys, FaultInjectionTest::kValExpectFound));
-  rocksdb::SyncPoint::GetInstance()->DisableProcessing();
-  rocksdb::SyncPoint::GetInstance()->ClearAllCallBacks();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 TEST_P(FaultInjectionTest, ManualLogSyncTest) {
@@ -515,9 +521,9 @@ TEST_P(FaultInjectionTest, WriteBatchWalTerminationTest) {
   wo.sync = true;
   wo.disableWAL = false;
   WriteBatch batch;
-  batch.Put("cats", "dogs");
+  ASSERT_OK(batch.Put("cats", "dogs"));
   batch.MarkWalTerminationPoint();
-  batch.Put("boys", "girls");
+  ASSERT_OK(batch.Put("boys", "girls"));
   ASSERT_OK(db_->Write(wo, &batch));
 
   env_->SetFilesystemActive(false);
@@ -530,9 +536,19 @@ TEST_P(FaultInjectionTest, WriteBatchWalTerminationTest) {
   ASSERT_EQ(db_->Get(ro, "boys", &val), Status::NotFound());
 }
 
-INSTANTIATE_TEST_CASE_P(FaultTest, FaultInjectionTest, ::testing::Bool());
+INSTANTIATE_TEST_CASE_P(
+    FaultTest, FaultInjectionTest,
+    ::testing::Values(std::make_tuple(false, kDefault, kEnd),
+                      std::make_tuple(true, kDefault, kEnd)));
 
-}  // namespace rocksdb
+INSTANTIATE_TEST_CASE_P(
+    FaultTest, FaultInjectionTestSplitted,
+    ::testing::Values(std::make_tuple(false, kDefault, kSyncWal),
+                      std::make_tuple(true, kDefault, kSyncWal),
+                      std::make_tuple(false, kSyncWal, kEnd),
+                      std::make_tuple(true, kSyncWal, kEnd)));
+
+}  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);

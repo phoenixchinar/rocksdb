@@ -18,7 +18,7 @@
 #include "util/autovector.h"
 #include "port/port.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 // Cleanup function that will be called for a stored thread local
 // pointer (if not NULL) when one of the following happens:
@@ -44,6 +44,9 @@ typedef void (*UnrefHandler)(void* ptr);
 class ThreadLocalPtr {
  public:
   explicit ThreadLocalPtr(UnrefHandler handler = nullptr);
+
+  ThreadLocalPtr(const ThreadLocalPtr&) = delete;
+  ThreadLocalPtr& operator=(const ThreadLocalPtr&) = delete;
 
   ~ThreadLocalPtr();
 
@@ -95,4 +98,4 @@ private:
   const uint32_t id_;
 };
 
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE

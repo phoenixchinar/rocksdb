@@ -8,17 +8,17 @@
 
 #include "utilities/merge_operators/bytesxor.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 std::shared_ptr<MergeOperator> MergeOperators::CreateBytesXOROperator() {
   return std::make_shared<BytesXOROperator>();
 }
 
-bool BytesXOROperator::Merge(const Slice& key,
+bool BytesXOROperator::Merge(const Slice& /*key*/,
                             const Slice* existing_value,
                             const Slice& value,
                             std::string* new_value,
-                            Logger* logger) const {
+                            Logger* /*logger*/) const {
   XOR(existing_value, value, new_value);
   return true;
 }
@@ -49,11 +49,11 @@ void BytesXOROperator::XOR(const Slice* existing_value,
       new_value->push_back(existing_value_data[i]);
     }
   } else {
-	  assert(value.size() == max_size);
+    assert(value.size() == max_size);
     for (size_t i = min_size; i < max_size; i++) {
       new_value->push_back(value_data[i]);
     }
   }
 }
 
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE

@@ -5,9 +5,11 @@
 
 #pragma once
 
+#include <cinttypes>
+
 #include "util/set_comparator.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 // During recovery if the memtable is flushed we cannot rely on its help on
 // duplicate key detection and as key insert will not be attempted. This class
 // will be used as a emulator of memtable to tell if insertion of a key/seq
@@ -41,8 +43,26 @@ class DuplicateDetector {
   using CFKeys = std::set<Slice, SetComparator>;
   std::map<uint32_t, CFKeys> keys_;
   void InitWithComp(const uint32_t cf) {
-    auto cmp = db_->GetColumnFamilyHandle(cf)->GetComparator();
+    auto h = db_->GetColumnFamilyHandle(cf);
+    if (!h) {
+      // TODO(myabandeh): This is not a concern in MyRocks as drop cf is not
+      // implemented yet. When it does, we should return proper error instead
+      // of throwing exception.
+      ROCKS_LOG_FATAL(
+          db_->immutable_db_options().info_log,
+          "Recovering an entry from the dropped column family %" PRIu32
+          ". WAL must must have been emptied before dropping the column "
+          "family", cf);
+#ifndef ROCKSDB_LITE
+      throw std::runtime_error(
+          "Recovering an entry from a dropped column family. "
+          "WAL must must have been flushed before dropping the column "
+          "family");
+#endif
+      return;
+    }
+    auto cmp = h->GetComparator();
     keys_[cf] = CFKeys(SetComparator(cmp));
   }
 };
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE

@@ -5,11 +5,11 @@
 
 #pragma once
 
-#include <assert.h>
-#include <stdint.h>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <type_traits>
 #include <vector>
@@ -24,7 +24,7 @@
 #include "rocksdb/write_batch.h"
 #include "util/autovector.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 class WriteThread {
  public:
@@ -119,6 +119,7 @@ class WriteThread {
     bool disable_wal;
     bool disable_memtable;
     size_t batch_cnt;  // if non-zero, number of sub-batches in the write batch
+    size_t protection_bytes_per_key;
     PreReleaseCallback* pre_release_callback;
     uint64_t log_used;  // log number that this batch was inserted into
     uint64_t log_ref;   // log number that memtable insert should reference
@@ -127,7 +128,7 @@ class WriteThread {
     std::atomic<uint8_t> state;  // write under StateMutex() or pre-link
     WriteGroup* write_group;
     SequenceNumber sequence;  // the sequence number to use for the first key
-    Status status;            // status of memtable inserter
+    Status status;
     Status callback_status;   // status returned by callback->Callback()
 
     std::aligned_storage<sizeof(std::mutex)>::type state_mutex_bytes;
@@ -142,6 +143,7 @@ class WriteThread {
           disable_wal(false),
           disable_memtable(false),
           batch_cnt(0),
+          protection_bytes_per_key(0),
           pre_release_callback(nullptr),
           log_used(0),
           log_ref(0),
@@ -163,6 +165,7 @@ class WriteThread {
           disable_wal(write_options.disableWAL),
           disable_memtable(_disable_memtable),
           batch_cnt(_batch_cnt),
+          protection_bytes_per_key(_batch->GetProtectionBytesPerKey()),
           pre_release_callback(_pre_release_callback),
           log_used(0),
           log_ref(_log_ref),
@@ -179,6 +182,8 @@ class WriteThread {
         StateMutex().~mutex();
         StateCV().~condition_variable();
       }
+      status.PermitUncheckedError();
+      callback_status.PermitUncheckedError();
     }
 
     bool CheckCallback(DB* db) {
@@ -289,7 +294,7 @@ class WriteThread {
   //
   // WriteGroup* write_group: the write group
   // Status status:           Status of write operation
-  void ExitAsBatchGroupLeader(WriteGroup& write_group, Status status);
+  void ExitAsBatchGroupLeader(WriteGroup& write_group, Status& status);
 
   // Exit batch group on behalf of batch group leader.
   void ExitAsBatchGroupFollower(Writer* w);
@@ -342,6 +347,13 @@ class WriteThread {
     return last_sequence_;
   }
 
+  // Insert a dummy writer at the tail of the write queue to indicate a write
+  // stall, and fail any writers in the queue with no_slowdown set to true
+  void BeginWriteStall();
+
+  // Remove the dummy writer and wake up waiting writers
+  void EndWriteStall();
+
  private:
   // See AwaitState.
   const uint64_t max_yield_usec_;
@@ -352,6 +364,11 @@ class WriteThread {
 
   // Enable pipelined write to WAL and memtable.
   const bool enable_pipelined_write_;
+
+  // The maximum limit of number of bytes that are written in a single batch
+  // of WAL or memtable write. It is followed when the leader write size
+  // is larger than 1/8 of this limit.
+  const uint64_t max_write_batch_group_size_bytes;
 
   // Points to the newest pending writer. Only leader can remove
   // elements, adding can be done lock-free by anybody.
@@ -364,6 +381,17 @@ class WriteThread {
   // The last sequence that have been consumed by a writer. The sequence
   // is not necessary visible to reads because the writer can be ongoing.
   SequenceNumber last_sequence_;
+
+  // A dummy writer to indicate a write stall condition. This will be inserted
+  // at the tail of the writer queue by the leader, so newer writers can just
+  // check for this and bail
+  Writer write_stall_dummy_;
+
+  // Mutex and condvar for writers to block on a write stall. During a write
+  // stall, writers with no_slowdown set to false will wait on this rather
+  // on the writer queue
+  port::Mutex stall_mu_;
+  port::CondVar stall_cv_;
 
   // Waits for w->state & goal_mask using w->StateMutex().  Returns
   // the state that satisfies goal_mask.
@@ -392,6 +420,10 @@ class WriteThread {
   // concurrently with itself.
   void CreateMissingNewerLinks(Writer* head);
 
+  // Starting from a pending writer, follow link_older to search for next
+  // leader, until we hit boundary.
+  Writer* FindNextLeader(Writer* pending_writer, Writer* boundary);
+
   // Set the leader in write_group to completed state and remove it from the
   // write group.
   void CompleteLeader(WriteGroup& write_group);
@@ -401,4 +433,4 @@ class WriteThread {
   void CompleteFollower(Writer* w, WriteGroup& write_group);
 };
 
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE

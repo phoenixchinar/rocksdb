@@ -8,29 +8,30 @@
 #ifndef ROCKSDB_LITE
 
 #include <functional>
+#include <limits>
 #include <string>
 #include <vector>
+
 #include "rocksdb/db.h"
 #include "rocksdb/status.h"
 #include "rocksdb/utilities/stackable_db.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 namespace blob_db {
 
-class TTLExtractor;
-
 // A wrapped database which puts values of KV pairs in a separate log
 // and store location to the log in the underlying DB.
-// It lacks lots of importatant functionalities, e.g. DB restarts,
-// garbage collection, iterators, etc.
 //
 // The factory needs to be moved to include/rocksdb/utilities to allow
 // users to use blob DB.
 
+constexpr uint64_t kNoExpiration = std::numeric_limits<uint64_t>::max();
+
 struct BlobDBOptions {
-  // name of the directory under main db, where blobs will be stored.
-  // default is "blob_dir"
+  // Name of the directory under the base DB where blobs will be stored. Using
+  // a directory where the base DB stores its SST files is not supported.
+  // Default is "blob_dir"
   std::string blob_dir = "blob_dir";
 
   // whether the blob_dir path is relative or absolute.
@@ -38,9 +39,7 @@ struct BlobDBOptions {
 
   // When max_db_size is reached, evict blob files to free up space
   // instead of returnning NoSpace error on write. Blob files will be
-  // evicted in this order until enough space is free up:
-  //  * the TTL blob file cloeset to expire,
-  //  * the oldest non-TTL blob file.
+  // evicted from oldest to newest, based on file creation time.
   bool is_fifo = false;
 
   // Maximum size of the database (including SST files and blob files).
@@ -56,7 +55,7 @@ struct BlobDBOptions {
   // and so on
   uint64_t ttl_range_secs = 3600;
 
-  // The smallest value to store in blob log. Value larger than this threshold
+  // The smallest value to store in blob log. Values smaller than this threshold
   // will be inlined in base DB together with the key.
   uint64_t min_blob_size = 0;
 
@@ -69,25 +68,17 @@ struct BlobDBOptions {
   // after it exceeds that size
   uint64_t blob_file_size = 256 * 1024 * 1024;
 
-  // Instead of setting TTL explicitly by calling PutWithTTL or PutUntil,
-  // applications can set a TTLExtractor which can extract TTL from key-value
-  // pairs.
-  std::shared_ptr<TTLExtractor> ttl_extractor = nullptr;
-
   // what compression to use for Blob's
   CompressionType compression = kNoCompression;
 
-  // If enabled, blob DB periodically cleanup stale data by rewriting remaining
-  // live data in blob files to new files. If garbage collection is not enabled,
-  // blob files will be cleanup based on TTL.
+  // If enabled, BlobDB cleans up stale blobs in non-TTL files during compaction
+  // by rewriting the remaining live blobs to new files.
   bool enable_garbage_collection = false;
 
-  // Time interval to trigger garbage collection, in seconds.
-  uint64_t garbage_collection_interval_secs = 60;
-
-  // If garbage collection is enabled, blob files with deleted size no less
-  // than this ratio will become candidates to be cleanup.
-  double garbage_collection_deletion_size_threshold = 0.75;
+  // The cutoff in terms of blob file age for garbage collection. Blobs in
+  // the oldest N non-TTL blob files will be rewritten when encountered during
+  // compaction, where N = garbage_collection_cutoff * number_of_non_TTL_files.
+  double garbage_collection_cutoff = 0.25;
 
   // Disable all background job. Used for test only.
   bool disable_background_tasks = false;
@@ -97,24 +88,24 @@ struct BlobDBOptions {
 
 class BlobDB : public StackableDB {
  public:
-  using rocksdb::StackableDB::Put;
+  using ROCKSDB_NAMESPACE::StackableDB::Put;
   virtual Status Put(const WriteOptions& options, const Slice& key,
                      const Slice& value) override = 0;
   virtual Status Put(const WriteOptions& options,
                      ColumnFamilyHandle* column_family, const Slice& key,
                      const Slice& value) override {
-    if (column_family != DefaultColumnFamily()) {
+    if (column_family->GetID() != DefaultColumnFamily()->GetID()) {
       return Status::NotSupported(
           "Blob DB doesn't support non-default column family.");
     }
     return Put(options, key, value);
   }
 
-  using rocksdb::StackableDB::Delete;
+  using ROCKSDB_NAMESPACE::StackableDB::Delete;
   virtual Status Delete(const WriteOptions& options,
                         ColumnFamilyHandle* column_family,
                         const Slice& key) override {
-    if (column_family != DefaultColumnFamily()) {
+    if (column_family->GetID() != DefaultColumnFamily()->GetID()) {
       return Status::NotSupported(
           "Blob DB doesn't support non-default column family.");
     }
@@ -127,7 +118,7 @@ class BlobDB : public StackableDB {
   virtual Status PutWithTTL(const WriteOptions& options,
                             ColumnFamilyHandle* column_family, const Slice& key,
                             const Slice& value, uint64_t ttl) {
-    if (column_family != DefaultColumnFamily()) {
+    if (column_family->GetID() != DefaultColumnFamily()->GetID()) {
       return Status::NotSupported(
           "Blob DB doesn't support non-default column family.");
     }
@@ -141,19 +132,28 @@ class BlobDB : public StackableDB {
   virtual Status PutUntil(const WriteOptions& options,
                           ColumnFamilyHandle* column_family, const Slice& key,
                           const Slice& value, uint64_t expiration) {
-    if (column_family != DefaultColumnFamily()) {
+    if (column_family->GetID() != DefaultColumnFamily()->GetID()) {
       return Status::NotSupported(
           "Blob DB doesn't support non-default column family.");
     }
     return PutUntil(options, key, value, expiration);
   }
 
-  using rocksdb::StackableDB::Get;
+  using ROCKSDB_NAMESPACE::StackableDB::Get;
   virtual Status Get(const ReadOptions& options,
                      ColumnFamilyHandle* column_family, const Slice& key,
                      PinnableSlice* value) override = 0;
 
-  using rocksdb::StackableDB::MultiGet;
+  // Get value and expiration.
+  virtual Status Get(const ReadOptions& options,
+                     ColumnFamilyHandle* column_family, const Slice& key,
+                     PinnableSlice* value, uint64_t* expiration) = 0;
+  virtual Status Get(const ReadOptions& options, const Slice& key,
+                     PinnableSlice* value, uint64_t* expiration) {
+    return Get(options, DefaultColumnFamily(), key, value, expiration);
+  }
+
+  using ROCKSDB_NAMESPACE::StackableDB::MultiGet;
   virtual std::vector<Status> MultiGet(
       const ReadOptions& options,
       const std::vector<Slice>& keys,
@@ -164,7 +164,7 @@ class BlobDB : public StackableDB {
       const std::vector<Slice>& keys,
       std::vector<std::string>* values) override {
     for (auto column_family : column_families) {
-      if (column_family != DefaultColumnFamily()) {
+      if (column_family->GetID() != DefaultColumnFamily()->GetID()) {
         return std::vector<Status>(
             column_families.size(),
             Status::NotSupported(
@@ -173,15 +173,25 @@ class BlobDB : public StackableDB {
     }
     return MultiGet(options, keys, values);
   }
+  virtual void MultiGet(const ReadOptions& /*options*/,
+                        ColumnFamilyHandle* /*column_family*/,
+                        const size_t num_keys, const Slice* /*keys*/,
+                        PinnableSlice* /*values*/, Status* statuses,
+                        const bool /*sorted_input*/ = false) override {
+    for (size_t i = 0; i < num_keys; ++i) {
+      statuses[i] = Status::NotSupported(
+          "Blob DB doesn't support batched MultiGet");
+    }
+  }
 
-  using rocksdb::StackableDB::SingleDelete;
+  using ROCKSDB_NAMESPACE::StackableDB::SingleDelete;
   virtual Status SingleDelete(const WriteOptions& /*wopts*/,
                               ColumnFamilyHandle* /*column_family*/,
                               const Slice& /*key*/) override {
     return Status::NotSupported("Not supported operation in blob db.");
   }
 
-  using rocksdb::StackableDB::Merge;
+  using ROCKSDB_NAMESPACE::StackableDB::Merge;
   virtual Status Merge(const WriteOptions& /*options*/,
                        ColumnFamilyHandle* /*column_family*/,
                        const Slice& /*key*/, const Slice& /*value*/) override {
@@ -190,19 +200,40 @@ class BlobDB : public StackableDB {
 
   virtual Status Write(const WriteOptions& opts,
                        WriteBatch* updates) override = 0;
-
-  using rocksdb::StackableDB::NewIterator;
+  using ROCKSDB_NAMESPACE::StackableDB::NewIterator;
   virtual Iterator* NewIterator(const ReadOptions& options) override = 0;
   virtual Iterator* NewIterator(const ReadOptions& options,
                                 ColumnFamilyHandle* column_family) override {
-    if (column_family != DefaultColumnFamily()) {
+    if (column_family->GetID() != DefaultColumnFamily()->GetID()) {
       // Blob DB doesn't support non-default column family.
       return nullptr;
     }
     return NewIterator(options);
   }
 
-  using rocksdb::StackableDB::Close;
+  Status CompactFiles(
+      const CompactionOptions& compact_options,
+      const std::vector<std::string>& input_file_names, const int output_level,
+      const int output_path_id = -1,
+      std::vector<std::string>* const output_file_names = nullptr,
+      CompactionJobInfo* compaction_job_info = nullptr) override = 0;
+  Status CompactFiles(
+      const CompactionOptions& compact_options,
+      ColumnFamilyHandle* column_family,
+      const std::vector<std::string>& input_file_names, const int output_level,
+      const int output_path_id = -1,
+      std::vector<std::string>* const output_file_names = nullptr,
+      CompactionJobInfo* compaction_job_info = nullptr) override {
+    if (column_family->GetID() != DefaultColumnFamily()->GetID()) {
+      return Status::NotSupported(
+          "Blob DB doesn't support non-default column family.");
+    }
+
+    return CompactFiles(compact_options, input_file_names, output_level,
+                        output_path_id, output_file_names, compaction_job_info);
+  }
+
+  using ROCKSDB_NAMESPACE::StackableDB::Close;
   virtual Status Close() override = 0;
 
   // Opening blob db.
@@ -230,33 +261,6 @@ class BlobDB : public StackableDB {
 Status DestroyBlobDB(const std::string& dbname, const Options& options,
                      const BlobDBOptions& bdb_options);
 
-// TTLExtractor allow applications to extract TTL from key-value pairs.
-// This useful for applications using Put or WriteBatch to write keys and
-// don't intend to migrate to PutWithTTL or PutUntil.
-//
-// Applications can implement either ExtractTTL or ExtractExpiration. If both
-// are implemented, ExtractExpiration will take precedence.
-class TTLExtractor {
- public:
-  // Extract TTL from key-value pair.
-  // Return true if the key has TTL, false otherwise. If key has TTL,
-  // TTL is pass back through ttl. The method can optionally modify the value,
-  // pass the result back through new_value, and also set value_changed to true.
-  virtual bool ExtractTTL(const Slice& key, const Slice& value, uint64_t* ttl,
-                          std::string* new_value, bool* value_changed);
-
-  // Extract expiration time from key-value pair.
-  // Return true if the key has expiration time, false otherwise. If key has
-  // expiration time, it is pass back through expiration. The method can
-  // optionally modify the value, pass the result back through new_value,
-  // and also set value_changed to true.
-  virtual bool ExtractExpiration(const Slice& key, const Slice& value,
-                                 uint64_t now, uint64_t* expiration,
-                                 std::string* new_value, bool* value_changed);
-
-  virtual ~TTLExtractor() = default;
-};
-
 }  // namespace blob_db
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE
 #endif  // ROCKSDB_LITE

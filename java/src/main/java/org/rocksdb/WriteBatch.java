@@ -5,6 +5,8 @@
 
 package org.rocksdb;
 
+import java.nio.ByteBuffer;
+
 /**
  * WriteBatch holds a collection of updates to apply atomically to a DB.
  *
@@ -42,6 +44,8 @@ public class WriteBatch extends AbstractWriteBatch {
   /**
    * Constructs a WriteBatch instance from a serialized representation
    * as returned by {@link #data()}.
+   *
+   * @param serialized the serialized representation.
    */
   public WriteBatch(final byte[] serialized) {
     super(newWriteBatch(serialized, serialized.length));
@@ -63,8 +67,11 @@ public class WriteBatch extends AbstractWriteBatch {
    * Retrieve the serialized version of this batch.
    *
    * @return the serialized representation of this write batch.
+   *
+   * @throws RocksDBException if an error occurs whilst retrieving
+   *   the serialized batch data.
    */
-  public byte[] data() {
+  public byte[] data() throws RocksDBException {
     return data(nativeHandle_);
   }
 
@@ -78,45 +85,45 @@ public class WriteBatch extends AbstractWriteBatch {
   }
 
   /**
-   * Returns true if PutCF will be called during Iterate.
+   * Returns true if Put will be called during Iterate.
    *
-   * Return true if PutCF will be called during Iterate.
+   * @return true if Put will be called during Iterate.
    */
   public boolean hasPut() {
     return hasPut(nativeHandle_);
   }
 
   /**
-   * Returns true if DeleteCF will be called during Iterate.
+   * Returns true if Delete will be called during Iterate.
    *
-   * Return true if DeleteCF will be called during Iterate.
+   * @return true if Delete will be called during Iterate.
    */
   public boolean hasDelete() {
     return hasDelete(nativeHandle_);
   }
 
   /**
-   * Returns true if SingleDeleteCF will be called during Iterate.
+   * Returns true if SingleDelete will be called during Iterate.
    *
-   * Return true if SingleDeleteCF will be called during Iterate.
+   * @return true if SingleDelete will be called during Iterate.
    */
   public boolean hasSingleDelete() {
     return hasSingleDelete(nativeHandle_);
   }
 
   /**
-   * Returns true if DeleteRangeCF will be called during Iterate.
+   * Returns true if DeleteRange will be called during Iterate.
    *
-   * Return true if DeleteRangeCF will be called during Iterate.
+   * @return true if DeleteRange will be called during Iterate.
    */
   public boolean hasDeleteRange() {
     return hasDeleteRange(nativeHandle_);
   }
 
   /**
-   * Returns true if MergeCF will be called during Iterate.
+   * Returns true if Merge will be called during Iterate.
    *
-   * Return true if MergeCF will be called during Iterate.
+   * @return true if Merge will be called during Iterate.
    */
   public boolean hasMerge() {
     return hasMerge(nativeHandle_);
@@ -125,7 +132,7 @@ public class WriteBatch extends AbstractWriteBatch {
   /**
    * Returns true if MarkBeginPrepare will be called during Iterate.
    *
-   * Return true if MarkBeginPrepare will be called during Iterate.
+   * @return true if MarkBeginPrepare will be called during Iterate.
    */
   public boolean hasBeginPrepare() {
     return hasBeginPrepare(nativeHandle_);
@@ -134,7 +141,7 @@ public class WriteBatch extends AbstractWriteBatch {
   /**
    * Returns true if MarkEndPrepare will be called during Iterate.
    *
-   * Return true if MarkEndPrepare will be called during Iterate.
+   * @return true if MarkEndPrepare will be called during Iterate.
    */
   public boolean hasEndPrepare() {
     return hasEndPrepare(nativeHandle_);
@@ -143,7 +150,7 @@ public class WriteBatch extends AbstractWriteBatch {
   /**
    * Returns true if MarkCommit will be called during Iterate.
    *
-   * Return true if MarkCommit will be called during Iterate.
+   * @return true if MarkCommit will be called during Iterate.
    */
   public boolean hasCommit() {
     return hasCommit(nativeHandle_);
@@ -152,7 +159,7 @@ public class WriteBatch extends AbstractWriteBatch {
   /**
    * Returns true if MarkRollback will be called during Iterate.
    *
-   * Return true if MarkRollback will be called during Iterate.
+   * @return true if MarkRollback will be called during Iterate.
    */
   public boolean hasRollback() {
     return hasRollback(nativeHandle_);
@@ -218,6 +225,10 @@ public class WriteBatch extends AbstractWriteBatch {
   @Override final native void put(final long handle, final byte[] key,
       final int keyLen, final byte[] value, final int valueLen,
       final long cfHandle);
+  @Override
+  final native void putDirect(final long handle, final ByteBuffer key, final int keyOffset,
+      final int keyLength, final ByteBuffer value, final int valueOffset, final int valueLength,
+      final long cfHandle);
   @Override final native void merge(final long handle, final byte[] key,
       final int keyLen, final byte[] value, final int valueLen);
   @Override final native void merge(final long handle, final byte[] key,
@@ -231,6 +242,9 @@ public class WriteBatch extends AbstractWriteBatch {
       final int keyLen) throws RocksDBException;
   @Override final native void singleDelete(final long handle, final byte[] key,
       final int keyLen, final long cfHandle) throws RocksDBException;
+  @Override
+  final native void removeDirect(final long handle, final ByteBuffer key, final int keyOffset,
+      final int keyLength, final long cfHandle) throws RocksDBException;
   @Override
   final native void deleteRange(final long handle, final byte[] beginKey, final int beginKeyLen,
       final byte[] endKey, final int endKeyLen);
@@ -251,7 +265,7 @@ public class WriteBatch extends AbstractWriteBatch {
       final int serializedLength);
   private native void iterate(final long handle, final long handlerHandle)
       throws RocksDBException;
-  private native byte[] data(final long nativeHandle);
+  private native byte[] data(final long nativeHandle) throws RocksDBException;
   private native long getDataSize(final long nativeHandle);
   private native boolean hasPut(final long nativeHandle);
   private native boolean hasDelete(final long nativeHandle);
